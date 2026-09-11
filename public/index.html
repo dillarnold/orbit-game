@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&display=swap');
+
+  :root {
+    --bg-deep: #0a0e1a;
+    --bg-mid: #131a2e;
+    --panel: #161d33;
+    --line: #262f4a;
+    --ink: #e7ebf7;
+    --ink-dim: #8a92b2;
+    --accent: #62e0c4;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg-deep); color: var(--ink);
+    font-family: 'Quicksand', 'Segoe UI', sans-serif; overflow: hidden; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; align-items: baseline; justify-content: space-between;
+    padding: 14px 18px 10px; flex-wrap: wrap; gap: 8px; }
+  h1 { margin: 0; font-size: 20px; font-weight: 700; }
+  h1 span { color: var(--accent); }
+  #hint { font-size: 13px; color: var(--ink-dim); }
+  #stage-wrap { flex: 1; display: flex; gap: 14px; padding: 0 18px 18px; min-height: 0; }
+  #canvas-frame { position: relative; flex: 1; border-radius: 16px; border: 1px solid var(--line);
+    background: radial-gradient(circle at 20% 15%, rgba(98,224,196,0.06), transparent 40%),
+                radial-gradient(circle at 80% 85%, rgba(255,209,102,0.05), transparent 40%),
+                var(--bg-mid);
+    overflow: hidden; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #status { position: absolute; left: 14px; bottom: 12px; font-size: 12px; color: var(--ink-dim); }
+  #side { width: 190px; flex-shrink: 0; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 16px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  #side h2 { margin: 0; font-size: 12px; color: var(--ink-dim); font-weight: 600; }
+  #leaderboard { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column;
+    gap: 7px; overflow-y: auto; }
+  #leaderboard li { display: flex; align-items: center; gap: 8px; font-size: 14px;
+    padding: 6px 8px; border-radius: 9px; background: rgba(255,255,255,0.02); }
+  #leaderboard li.me { background: rgba(98,224,196,0.10); border: 1px solid rgba(98,224,196,0.25); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .lb-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lb-score { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  @media (max-width: 640px) {
+    #stage-wrap { flex-direction: column; }
+    #side { width: auto; flex-direction: row; overflow-x: auto; }
+    #leaderboard { flex-direction: row; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Orb<span>it</span></h1>
+    <div id="hint">Arrow keys / WASD to move · drag on touch · grab the glowing orb</div>
+  </header>
+  <div id="stage-wrap">
+    <div id="canvas-frame">
+      <canvas id="c"></canvas>
+      <div id="status">connecting…</div>
+    </div>
+    <div id="side">
+      <h2>Players here</h2>
+      <ul id="leaderboard"></ul>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ---- CONFIG -----------------------------------------------------------
+  // If this page is served by the same Worker as the game backend (the
+  // default setup), this auto-detects the right wss:// URL. If you're
+  // hosting this HTML file somewhere else (your own site, a CDN, etc.),
+  // replace the line below with your deployed Worker's URL, e.g.:
+  //   const WS_URL = "wss://orbit-game.YOUR-SUBDOMAIN.workers.dev/ws";
+  const WS_URL = location.origin.replace(/^http/, "ws") + "/ws";
+  // -------------------------------------------------------------------
+
+  const NAMES = ["Comet","Nebula","Photon","Quasar","Lumen","Ember","Drift","Halo","Vertex","Aster","Pulse","Zephyr"];
+  const COLORS = ["#62e0c4","#ff6b6b","#ffd166","#a78bfa","#4dabf7","#f783ac","#69db7c","#ff922b"];
+
+  const myName = NAMES[Math.floor(Math.random() * NAMES.length)] + "-" + Math.floor(Math.random() * 90 + 10);
+  const myColor = COLORS[Math.floor(Math.random() * COLORS.length)];
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const boardEl = document.getElementById("leaderboard");
+
+  let W = 0, H = 0;
+  function resize() {
+    const frame = canvas.parentElement;
+    W = canvas.width = frame.clientWidth;
+    H = canvas.height = frame.clientHeight;
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  const RADIUS = 16;
+  let myId = null;
+  let me = {
+    x: Math.random() * (W - 80) + 40,
+    y: Math.random() * (H - 80) + 40,
+    vx: 0, vy: 0,
+    score: 0,
+    name: myName,
+    color: myColor
+  };
+  let orb = { x: W / 2, y: H / 2 };
+  let players = {}; // remote: id -> {x,y,tx,ty,name,color,score}
+
+  const keys = {};
+  window.addEventListener("keydown", e => { keys[e.key.toLowerCase()] = true; });
+  window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+  let pointerTarget = null;
+  canvas.addEventListener("pointerdown", e => setPointer(e));
+  canvas.addEventListener("pointermove", e => { if (e.buttons) setPointer(e); });
+  canvas.addEventListener("pointerup", () => { pointerTarget = null; });
+  function setPointer(e) {
+    const r = canvas.getBoundingClientRect();
+    pointerTarget = { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  // ---- WebSocket ----------------------------------------------------
+  let ws;
+  let connected = false;
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({ type: "join", x: me.x, y: me.y, name: me.name, color: me.color }));
+    });
+    ws.addEventListener("message", (evt) => {
+      const data = JSON.parse(evt.data);
+      if (data.type === "init") {
+        myId = data.id;
+        orb = data.orb;
+        players = {};
+        for (const pid in data.players) {
+          if (pid === myId) continue;
+          const p = data.players[pid];
+          players[pid] = { ...p, tx: p.x, ty: p.y };
+        }
+        connected = true;
+        updateStatus();
+      } else if (data.type === "join") {
+        if (data.id !== myId) {
+          players[data.id] = { ...data.player, tx: data.player.x, ty: data.player.y };
+        }
+        updateStatus();
+      } else if (data.type === "move") {
+        const p = players[data.id];
+        if (p) { p.tx = data.x; p.ty = data.y; }
+      } else if (data.type === "orb") {
+        orb = data.orb;
+        if (data.scoreId === myId) {
+          me.score = data.score;
+        } else if (players[data.scoreId]) {
+          players[data.scoreId].score = data.score;
+        }
+      } else if (data.type === "leave") {
+        delete players[data.id];
+        updateStatus();
+      }
+    });
+    ws.addEventListener("close", () => {
+      connected = false;
+      statusEl.textContent = "disconnected — reconnecting…";
+      setTimeout(connect, 1000);
+    });
+    ws.addEventListener("error", () => ws.close());
+  }
+
+  function updateStatus() {
+    statusEl.textContent = connected ? (Object.keys(players).length + 1) + " connected" : "connecting…";
+  }
+
+  function sendMove() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "move", x: me.x, y: me.y }));
+    }
+  }
+  function sendGrab() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "grab", orbX: orb.x, orbY: orb.y }));
+    }
+  }
+
+  // ---- Physics (client-predicted for me, interpolated for others) ---
+  function physicsStep() {
+    const accel = 0.6, friction = 0.90, maxSpeed = 6;
+
+    if (pointerTarget) {
+      const dx = pointerTarget.x - me.x, dy = pointerTarget.y - me.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      if (dist > 4) {
+        me.vx += (dx / dist) * accel * 1.4;
+        me.vy += (dy / dist) * accel * 1.4;
+      }
+    } else {
+      if (keys["arrowleft"] || keys["a"]) me.vx -= accel;
+      if (keys["arrowright"] || keys["d"]) me.vx += accel;
+      if (keys["arrowup"] || keys["w"]) me.vy -= accel;
+      if (keys["arrowdown"] || keys["s"]) me.vy += accel;
+    }
+
+    me.vx *= friction; me.vy *= friction;
+    const speed = Math.hypot(me.vx, me.vy);
+    if (speed > maxSpeed) { me.vx = (me.vx / speed) * maxSpeed; me.vy = (me.vy / speed) * maxSpeed; }
+
+    me.x += me.vx; me.y += me.vy;
+    if (me.x < RADIUS) { me.x = RADIUS; me.vx *= -0.5; }
+    if (me.x > W - RADIUS) { me.x = W - RADIUS; me.vx *= -0.5; }
+    if (me.y < RADIUS) { me.y = RADIUS; me.vy *= -0.5; }
+    if (me.y > H - RADIUS) { me.y = H - RADIUS; me.vy *= -0.5; }
+
+    if (Math.hypot(me.x - orb.x, me.y - orb.y) < RADIUS + 10) {
+      sendGrab(); // server decides who actually gets the point
+    }
+
+    for (const pid in players) {
+      const p = players[pid];
+      p.x += (p.tx - p.x) * 0.25;
+      p.y += (p.ty - p.y) * 0.25;
+    }
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(255,255,255,0.03)";
+    ctx.lineWidth = 1;
+    const step = 40;
+    for (let x = 0; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    for (let y = 0; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+    const t = Date.now() / 300;
+    const pulse = 4 + Math.sin(t) * 2;
+    const grad = ctx.createRadialGradient(orb.x, orb.y, 0, orb.x, orb.y, 22 + pulse);
+    grad.addColorStop(0, "#ffd166");
+    grad.addColorStop(1, "rgba(255,209,102,0)");
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(orb.x, orb.y, 22 + pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffd166";
+    ctx.beginPath(); ctx.arc(orb.x, orb.y, 8, 0, Math.PI * 2); ctx.fill();
+
+    for (const pid in players) {
+      const p = players[pid];
+      drawBall(p.x, p.y, p.color, p.name, p.score, false);
+    }
+    drawBall(me.x, me.y, me.color, me.name + " (you)", me.score, true);
+  }
+
+  function drawBall(x, y, color, name, score, isMe) {
+    const g = ctx.createRadialGradient(x, y, 0, x, y, RADIUS + 10);
+    g.addColorStop(0, color + "55");
+    g.addColorStop(1, color + "00");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, RADIUS + 10, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, RADIUS, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = isMe ? "#ffffff" : "rgba(255,255,255,0.4)";
+    ctx.lineWidth = isMe ? 2 : 1;
+    ctx.stroke();
+    ctx.font = "600 12px Quicksand, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(231,235,247,0.85)";
+    ctx.fillText(name, x, y - RADIUS - 10);
+  }
+
+  function updateLeaderboard() {
+    const all = [{ id: "me", name: me.name + " (you)", color: me.color, score: me.score }];
+    for (const pid in players) {
+      const p = players[pid];
+      all.push({ id: pid, name: p.name, color: p.color, score: p.score });
+    }
+    all.sort((a, b) => b.score - a.score);
+    boardEl.innerHTML = all.map(p => `
+      <li class="${p.id === 'me' ? 'me' : ''}">
+        <span class="dot" style="background:${p.color}"></span>
+        <span class="lb-name">${escapeHtml(p.name)}</span>
+        <span class="lb-score">${p.score}</span>
+      </li>
+    `).join("");
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function loop() {
+    physicsStep();
+    draw();
+    updateLeaderboard();
+    requestAnimationFrame(loop);
+  }
+
+  connect();
+  loop();
+  setInterval(sendMove, 60); // ~16 updates/sec
+})();
+</script>
+</body>
+</html>
